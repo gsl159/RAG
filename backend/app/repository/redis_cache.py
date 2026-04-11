@@ -29,8 +29,11 @@ class CacheStats:
         total = self.hits + self.misses
         return round(self.hits / total, 4) if total else 0.0
 
-    def record_hit(self):   self.hits   += 1
-    def record_miss(self):  self.misses += 1
+    def record_hit(self):
+        self.hits += 1
+
+    def record_miss(self):
+        self.misses += 1
 
 
 # 全局统计
@@ -49,6 +52,13 @@ class RedisCache:
         self.client: Optional[aioredis.Redis] = None
         # 当前 embedding 版本（与 doc_version 共同控制缓存失效）
         self.embedding_version: str = "v1"
+
+    @staticmethod
+    def _norm_query_text(q: str) -> str:
+        """归一化 query 键：空白折叠 + 小写，提高相似问题缓存命中率。"""
+        import re
+
+        return re.sub(r"\s+", " ", (q or "").strip().lower())
 
     async def connect(self):
         self.client = aioredis.from_url(
@@ -73,7 +83,12 @@ class RedisCache:
     async def _safe_set(self, key: str, value: str, ttl: int):
         if not self.client:
             return
-        jitter = random.randint(0, max(ttl // 10, 1))
+        # 仅对热路径 query/rag 层加 jitter，减轻缓存雪崩；embed 等保持固定 TTL
+        jitter = 0
+        if ttl > 0 and (
+            key.startswith("cache:query:") or key.startswith("cache:rag:")
+        ):
+            jitter = random.randint(0, max(ttl // 10, 1))
         try:
             await self.client.set(key, value, ex=ttl + jitter)
         except Exception as e:
@@ -90,7 +105,7 @@ class RedisCache:
     # ── Layer 1: Query Cache ──────────────────────
 
     def _query_key(self, query: str, doc_version: int = 0) -> str:
-        h = hashlib.md5(query.encode()).hexdigest()
+        h = hashlib.sha256(self._norm_query_text(query).encode()).hexdigest()
         return f"cache:query:{h}:{doc_version}:{self.embedding_version}"
 
     async def get_query(self, query: str, doc_version: int = 0) -> Optional[dict]:
@@ -114,7 +129,7 @@ class RedisCache:
     # ── Layer 2: Embedding Cache ──────────────────
 
     def _embed_key(self, text: str) -> str:
-        h = hashlib.md5(text.encode()).hexdigest()
+        h = hashlib.sha256(text.encode()).hexdigest()
         return f"cache:embed:{h}:{self.embedding_version}"
 
     async def get_embed(self, text: str) -> Optional[list]:
@@ -138,7 +153,7 @@ class RedisCache:
     # ── Layer 3: RAG Pipeline Cache ───────────────
 
     def _rag_key(self, query: str, doc_version: int = 0) -> str:
-        h = hashlib.md5(query.encode()).hexdigest()
+        h = hashlib.sha256(self._norm_query_text(query).encode()).hexdigest()
         return f"cache:rag:{h}:{doc_version}:{self.embedding_version}"
 
     async def get_rag(self, query: str, doc_version: int = 0) -> Optional[dict]:
@@ -195,6 +210,42 @@ class RedisCache:
         finally:
             _inflight.pop(key, None)
 
+    # ── Session History（多轮对话记忆）────────────
+
+    def _session_key(self, session_id: str) -> str:
+        return f"session:history:{session_id}"
+
+    async def get_session_history(self, session_id: str, max_turns: int = 10) -> list:
+        """获取会话历史，返回 [{"role":"user","content":"..."},{"role":"assistant","content":"..."}]"""
+        if not self.client or not session_id:
+            return []
+        try:
+            raw = await self.client.lrange(self._session_key(session_id), -max_turns * 2, -1)
+            import json as _json
+            return [_json.loads(item) for item in raw]
+        except Exception as e:
+            logger.warning(f"获取会话历史失败: {e}")
+            return []
+
+    async def append_session_history(self, session_id: str, role: str, content: str):
+        """追加一条对话记录到会话历史"""
+        if not self.client or not session_id:
+            return
+        try:
+            import json as _json
+            item = _json.dumps({"role": role, "content": content[:1000]}, ensure_ascii=False)
+            key = self._session_key(session_id)
+            await self.client.rpush(key, item)
+            await self.client.ltrim(key, -20, -1)  # 最多保留 20 条（10 轮）
+            await self.client.expire(key, 3600)     # 1 小时过期
+        except Exception as e:
+            logger.warning(f"追加会话历史失败: {e}")
+
+    async def clear_session_history(self, session_id: str):
+        """清空会话历史"""
+        if session_id:
+            await self._safe_delete(self._session_key(session_id))
+
     # ── 版本管理 ──────────────────────────────────
 
     async def get_global_doc_version(self) -> int:
@@ -214,6 +265,29 @@ class RedisCache:
         except Exception as e:
             logger.warning(f"doc_version incr 失败: {e}")
             return 0
+
+    UPLOAD_LOCK_PREFIX = "upload:lock:"
+
+    async def try_acquire_upload_lock(self, key_suffix: str, ttl_sec: int = 120) -> bool:
+        """并发上传同内容去重：返回 True 表示获得锁；无 Redis 时放行。"""
+        if not self.client:
+            return True
+        try:
+            r = await self.client.set(
+                f"{self.UPLOAD_LOCK_PREFIX}{key_suffix}", "1", nx=True, ex=ttl_sec
+            )
+            return bool(r)
+        except Exception as e:
+            logger.warning(f"Redis upload lock set failed: {e}")
+            return True
+
+    async def release_upload_lock(self, key_suffix: str) -> None:
+        if not self.client:
+            return
+        try:
+            await self.client.delete(f"{self.UPLOAD_LOCK_PREFIX}{key_suffix}")
+        except Exception as e:
+            logger.warning(f"Redis upload lock delete failed: {e}")
 
     # ── Stats ─────────────────────────────────────
 

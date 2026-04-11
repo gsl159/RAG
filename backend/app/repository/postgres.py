@@ -1,8 +1,8 @@
+﻿"""
+PostgreSQL ORM 鈥?鍖呭惈鐢ㄦ埛銆佸璁℃棩蹇楃瓑瀹屾暣妯″瀷
+鏀寔锛歅ostgreSQL锛堢敓浜э級鍜?SQLite锛堟祴璇曪級
 """
-PostgreSQL ORM — 包含用户、审计日志等完整模型
-支持：PostgreSQL（生产）和 SQLite（测试）
-"""
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import AsyncGenerator
 
 from sqlalchemy import (
@@ -14,7 +14,12 @@ from sqlalchemy.orm import DeclarativeBase
 
 from app.config.settings import settings
 
-# PostgreSQL 支持连接池；SQLite 不支持 pool_size/max_overflow
+
+def _utcnow():
+    """返回不带时区的 UTC 时间，兼容 TIMESTAMP WITHOUT TIME ZONE 列"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+# PostgreSQL 鏀寔杩炴帴姹狅紱SQLite 涓嶆敮鎸?pool_size/max_overflow
 _is_sqlite = settings.DATABASE_URL.startswith("sqlite")
 
 _engine_kwargs = {"echo": False, "pool_pre_ping": True}
@@ -39,8 +44,11 @@ class User(Base):
     tenant_id  = Column(String(64), default="default")
     dept_id    = Column(String(64))
     is_active  = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    __table_args__ = (Index("idx_user_username", "username"),)
+    created_at = Column(DateTime, default=_utcnow)
+    __table_args__ = (
+        Index("idx_user_username", "username"),
+        Index("idx_user_created_id", "created_at", "id"),
+    )
 
 
 class Document(Base):
@@ -57,8 +65,8 @@ class Document(Base):
     tenant_id   = Column(String(64), default="default")
     dept_id     = Column(String(64))
     error_msg   = Column(Text)
-    created_at  = Column(DateTime, default=datetime.utcnow)
-    updated_at  = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at  = Column(DateTime, default=_utcnow)
+    updated_at  = Column(DateTime, default=_utcnow, onupdate=_utcnow)
     __table_args__ = (
         Index("idx_docs_status",  "status"),
         Index("idx_docs_created", "created_at"),
@@ -74,7 +82,7 @@ class Chunk(Base):
     chunk_idx  = Column(Integer, nullable=False)
     char_count = Column(Integer, default=0)
     meta_info  = Column(JSON, default=dict)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
     __table_args__ = (Index("idx_chunks_doc_id", "doc_id"),)
 
 
@@ -99,7 +107,8 @@ class QueryLog(Base):
     token_count     = Column(Integer, default=0)
     degrade_level   = Column(String(4))
     degrade_reason  = Column(String(64))
-    created_at      = Column(DateTime, default=datetime.utcnow)
+    share_token     = Column(String(64), unique=True, nullable=True)
+    created_at      = Column(DateTime, default=_utcnow)
     __table_args__ = (
         Index("idx_qlog_created", "created_at"),
         Index("idx_qlog_trace",   "trace_id"),
@@ -118,7 +127,7 @@ class Evaluation(Base):
     completeness = Column(Float, default=0.0)
     overall      = Column(Float, default=0.0)
     reason       = Column(Text)
-    created_at   = Column(DateTime, default=datetime.utcnow)
+    created_at   = Column(DateTime, default=_utcnow)
     __table_args__ = (Index("idx_eval_created", "created_at"),)
 
 
@@ -132,13 +141,15 @@ class Feedback(Base):
     query      = Column(Text, nullable=False)
     answer     = Column(Text)
     feedback   = Column(String(10), nullable=False)        # like / dislike
+    reason     = Column(String(32))                        # 绛旈潪鎵€闂?淇℃伅杩囨椂/涓嶅畬鏁?鏈夐敊璇?    correction = Column(Text)                              # 鐢ㄦ埛绾犳鏂囨湰
+    ratings    = Column(JSON)                              # {relevance, accuracy, completeness} 0-5
     comment    = Column(Text)
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
     __table_args__ = (Index("idx_fb_type", "feedback"),)
 
 
 class AuditLog(Base):
-    """操作审计日志"""
+    """鎿嶄綔瀹¤鏃ュ織"""
     __tablename__ = "audit_logs"
     id         = Column(Integer, primary_key=True, autoincrement=True)
     trace_id   = Column(String(32))
@@ -148,11 +159,46 @@ class AuditLog(Base):
     resource   = Column(String(256))
     detail     = Column(JSON)
     ip         = Column(String(64))
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=_utcnow)
     __table_args__ = (
         Index("idx_audit_created", "created_at"),
         Index("idx_audit_user",    "user_id"),
     )
+
+
+class ApiKey(Base):
+    """澶栭儴绯荤粺瀵规帴 API Key"""
+    __tablename__ = "api_keys"
+    id         = Column(String(64), primary_key=True)
+    user_id    = Column(String(64), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    tenant_id  = Column(String(64), default="default")
+    name       = Column(String(128), nullable=False)
+    key_hash   = Column(String(256), nullable=False)       # sha256(key) 鈥?涓嶅瓨鏄庢枃
+    prefix     = Column(String(12), nullable=False)        # 鐢ㄤ簬鏄剧ず "rag_xxxxxx..."
+    is_active  = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=_utcnow)
+    expires_at = Column(DateTime, nullable=True)
+    __table_args__ = (Index("idx_apikey_user", "user_id"),)
+
+
+class Tag(Base):
+    """鐭ヨ瘑搴撴爣绛?鍒嗙被"""
+    __tablename__ = "tags"
+    id         = Column(String(64), primary_key=True)
+    name       = Column(String(64), nullable=False)
+    tenant_id  = Column(String(64), default="default")
+    color      = Column(String(16), default="#4f7ef8")
+    created_at = Column(DateTime, default=_utcnow)
+    __table_args__ = (Index("idx_tag_tenant", "tenant_id"),)
+
+
+class DocTag(Base):
+    """鏂囨。-鏍囩鍏宠仈"""
+    __tablename__ = "doc_tags"
+    id     = Column(Integer, primary_key=True, autoincrement=True)
+    doc_id = Column(String(64), ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    tag_id = Column(String(64), ForeignKey("tags.id", ondelete="CASCADE"), nullable=False)
+    __table_args__ = (Index("idx_doctag_doc", "doc_id"), Index("idx_doctag_tag", "tag_id"),)
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
@@ -179,12 +225,19 @@ async def _ensure_default_admin():
         async with AsyncSessionLocal() as db:
             r = await db.execute(select(User).where(User.username == "admin"))
             if not r.scalar_one_or_none():
-                pw = bcrypt.hashpw(b"admin123", bcrypt.gensalt()).decode()
+                pw = bcrypt.hashpw(
+                    settings.DEFAULT_ADMIN_PASSWORD.encode(),
+                    bcrypt.gensalt(),
+                ).decode()
                 db.add(User(
                     id=str(uuid.uuid4()), username="admin",
                     password=pw, role="super_admin",
                 ))
                 await db.commit()
+                from app.utils.logger import logger
+                logger.warning(
+                    "已创建默认管理员 admin，请尽快修改密码！"
+                )
     except Exception as e:
         from app.utils.logger import logger
         logger.warning(f"默认管理员创建失败（可忽略）: {e}")

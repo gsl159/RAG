@@ -7,6 +7,7 @@
 """
 import re
 import uuid
+import traceback
 from pathlib import Path
 from typing import List, Dict, Any
 
@@ -48,15 +49,26 @@ class DocParser:
             return ""
 
     def _parse_pdf(self, path: str) -> str:
-        """pymupdf 解析 PDF，提取文本，保留段落结构"""
+        """pymupdf 按页抽取，总字符数受 PDF_MAX_EXTRACT_CHARS 限制，避免超大 PDF 占满内存。"""
         import fitz  # pymupdf
-        texts = []
+
+        texts: List[str] = []
+        total = 0
+        cap = settings.PDF_MAX_EXTRACT_CHARS
         with fitz.open(path) as doc:
             for page in doc:
-                # get_text("text") 保留换行结构
                 page_text = page.get_text("text")
-                if page_text.strip():
-                    texts.append(page_text)
+                if not page_text.strip():
+                    continue
+                if total >= cap:
+                    break
+                if total + len(page_text) > cap:
+                    remain = cap - total
+                    if remain > 50:
+                        texts.append(page_text[:remain])
+                    break
+                texts.append(page_text)
+                total += len(page_text)
         return "\n\n".join(texts)
 
     def _parse_docx(self, path: str) -> str:
@@ -241,13 +253,20 @@ class DocumentService:
                     f"质量分 {quality['score']:.2f} 低于阈值 {settings.QUALITY_THRESHOLD}，拒绝入库"
                 )
 
+            # Step 4.5: 过滤无效 chunk（过短文本会导致 Embedding API 异常）
+            valid_chunks = [c for c in chunks if len(c.strip()) >= self.checker.MIN_VALID_LEN]
+            if not valid_chunks:
+                raise ValueError("所有 chunk 均无效（长度不足），拒绝入库")
+            logger.info(f"过滤后有效 chunk: {len(valid_chunks)}/{len(chunks)}")
+            chunks = valid_chunks
+
             # Step 5: Embedding（批量，带进度日志）
             logger.info(f"开始 Embedding {len(chunks)} 个 chunk...")
             embeddings = await embed_client.embed_batch(chunks)
 
             # Step 6: Milvus 向量入库
             chunk_ids = [str(uuid.uuid4()) for _ in chunks]
-            milvus_db.insert(
+            await milvus_db.async_insert(
                 ids        = chunk_ids,
                 doc_ids    = [doc_id] * len(chunks),
                 chunk_idxs = list(range(len(chunks))),
@@ -284,10 +303,12 @@ class DocumentService:
             logger.info(f"✅ 文档 {doc_id} 处理完成，共 {len(chunks)} 个 chunk")
 
         except Exception as e:
-            logger.error(f"❌ 文档 {doc_id} 处理失败: {e}")
+            err_msg = repr(e)
+            logger.error(f"❌ 文档 {doc_id} 处理失败: {err_msg}")
+            logger.error(traceback.format_exc())
             try:
                 await db.rollback()
-                await self._set_status(db, doc_id, "failed", str(e))
+                await self._set_status(db, doc_id, "failed", err_msg[:500])
             except Exception as inner:
                 logger.error(f"状态回滚失败: {inner}")
             raise

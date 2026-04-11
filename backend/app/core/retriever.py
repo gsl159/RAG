@@ -2,6 +2,7 @@
 检索模块 — Hybrid Search（Dense Milvus + Sparse BM25）+ RRF 融合
 线程安全版：BM25 索引操作加锁
 """
+import re
 import threading
 from typing import List, Dict, Any, Optional
 
@@ -11,26 +12,52 @@ from app.utils.logger import logger
 from app.repository.vector_store import milvus_db
 
 
+def _tokenize(text: str) -> List[str]:
+    """分词：优先 jieba，回退到正则拆分（与 SimpleReranker 一致）"""
+    try:
+        import jieba
+        return [w for w in jieba.cut(text) if w.strip()]
+    except ImportError:
+        return re.findall(r'[\u4e00-\u9fa5]+|[a-zA-Z0-9]+', text)
+
+
 class HybridRetriever:
     """混合检索：向量召回 + BM25 → RRF 融合"""
 
     def __init__(self):
         self._corpus: List[str] = []
+        self._tokenized: List[List[str]] = []
         self._bm25:   Optional[BM25Okapi] = None
         self._lock = threading.Lock()
 
     def add_texts(self, texts: List[str]):
-        """新增文本到 BM25 索引（线程安全）"""
+        """新增文本到 BM25 索引（线程安全，增量分词）"""
+        if not texts:
+            return
         with self._lock:
             self._corpus.extend(texts)
-            tokenized  = [list(t) for t in self._corpus]
-            self._bm25 = BM25Okapi(tokenized)
+            # 只对新增文本分词，避免全量重建
+            new_tokenized = [_tokenize(t) for t in texts]
+            self._tokenized.extend(new_tokenized)
+            self._bm25 = BM25Okapi(self._tokenized)
         logger.debug(f"BM25 索引更新，共 {len(self._corpus)} 条")
 
     def reset(self):
         with self._lock:
             self._corpus = []
-            self._bm25   = None
+            self._tokenized = []
+            self._bm25 = None
+
+    def replace_corpus(self, texts: List[str]) -> None:
+        """全量替换 BM25 语料并单次构建索引（启动重建 / 大批量导入时优于反复 add_texts）。"""
+        if not texts:
+            self.reset()
+            return
+        with self._lock:
+            self._corpus = list(texts)
+            self._tokenized = [_tokenize(t) for t in self._corpus]
+            self._bm25 = BM25Okapi(self._tokenized)
+        logger.info(f"BM25 全量替换完成，共 {len(self._corpus)} 条")
 
     # ── BM25 稀疏检索 ─────────────────────────────
 
@@ -38,7 +65,7 @@ class HybridRetriever:
         with self._lock:
             if not self._bm25 or not self._corpus:
                 return []
-            scores  = self._bm25.get_scores(list(query))
+            scores  = self._bm25.get_scores(_tokenize(query))
             corpus  = list(self._corpus)  # 快照避免竞争
 
         if len(scores) == 0:
@@ -105,7 +132,7 @@ class HybridRetriever:
 
         dense: List[Dict] = []
         try:
-            dense = milvus_db.search(query_vec, top_k=top_k)
+            dense = await milvus_db.async_search(query_vec, top_k=top_k)
         except Exception as e:
             logger.warning(f"Milvus 检索失败（降级到纯BM25）: {e}")
 
