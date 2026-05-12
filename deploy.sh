@@ -45,7 +45,11 @@ fi
 step "配置环境变量"
 if [ ! -f .env ]; then
   info "未检测到 .env，正在生成默认配置…"
-  cat > .env << 'ENV'
+  # 自动生成安全的 JWT_SECRET
+  JWT_SECRET_VALUE=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || echo "change-me-$(date +%s)-$(head -c 16 /dev/urandom | xxd -p)")
+  # 自动生成安全的管理员密码
+  ADMIN_PASS_VALUE=$(openssl rand -base64 16 2>/dev/null || python3 -c "import secrets; print(secrets.token_urlsafe(16))" 2>/dev/null || echo "Admin@$(date +%s)")
+  cat > .env << ENV
 # =============================================
 # RAG System — 环境配置
 # =============================================
@@ -93,6 +97,12 @@ CACHE_TTL_RAG=3600
 # 日志
 LOG_LEVEL=INFO
 APP_ENV=production
+
+# JWT（已自动生成，无需手动修改）
+JWT_SECRET=${JWT_SECRET_VALUE}
+
+# 管理员初始密码（已自动生成，首次登录后请立即修改）
+DEFAULT_ADMIN_PASSWORD=${ADMIN_PASS_VALUE}
 ENV
   echo ""
   warn "┌──────────────────────────────────────────┐"
@@ -176,7 +186,7 @@ echo -e "${BOLD}${GREEN}╠═════════════════�
 echo -e "${BOLD}${GREEN}║${RESET}  前端入口:   ${BOLD}http://localhost:3000${RESET}       ${BOLD}${GREEN}║${RESET}"
 echo -e "${BOLD}${GREEN}║${RESET}  API 文档:   ${BOLD}http://localhost:8000/docs${RESET}  ${BOLD}${GREEN}║${RESET}"
 echo -e "${BOLD}${GREEN}║${RESET}  MinIO 控台: ${BOLD}http://localhost:9001${RESET}       ${BOLD}${GREEN}║${RESET}"
-echo -e "${BOLD}${GREEN}║${RESET}  (MinIO: minioadmin / minioadmin123)    ${BOLD}${GREEN}║${RESET}"
+echo -e "${BOLD}${GREEN}║${RESET}  (MinIO 凭据请查看 .env 文件)           ${BOLD}${GREEN}║${RESET}"
 echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════╝${RESET}"
 echo ""
 echo -e "  ${YELLOW}常用命令：${RESET}"

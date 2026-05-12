@@ -19,4 +19,7 @@ EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+# 生产使用 gunicorn + uvicorn workers，支持多 worker 并行
+# WORKERS 默认 2，可通过环境变量覆盖
+ENV WORKERS=2
+CMD ["sh", "-c", "gunicorn app.main:app -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --workers ${WORKERS} --timeout 120 --graceful-timeout 30 --access-logfile -"]

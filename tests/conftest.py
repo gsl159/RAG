@@ -1,74 +1,162 @@
-"""
-pytest 配置 — 路径设置，让 app.* 导入可用
-提供公共 fixtures
+"""Shared test fixtures for enterprise RAG system.
+
+Uses dependency injection — no monkey-patching required.
+Inject mock implementations directly into domain ports.
 """
 import sys
+import os
 import asyncio
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
-
 import pytest
+from unittest.mock import AsyncMock, MagicMock
 
-# 将 backend/ 目录加入 Python path
-backend_path = Path(__file__).parent.parent / "backend"
-sys.path.insert(0, str(backend_path))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "backend"))
+
+# Set test environment before any imports
+os.environ.setdefault("APP_ENV", "testing")
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///test.db")
+os.environ.setdefault("JWT_SECRET", "test-secret-key-for-testing")
+os.environ.setdefault("SILICONFLOW_API_KEY", "sk-test")
+os.environ.setdefault("SILICONFLOW_API_BASE", "http://localhost:8080")
+os.environ.setdefault("LLM_MODEL", "test-model")
+os.environ.setdefault("EMBED_MODEL", "test-embed")
 
 
-# ── 公共 Fixtures ──────────────────────────────
-
-@pytest.fixture(scope="session")
+@pytest.fixture
 def event_loop_policy():
     return asyncio.DefaultEventLoopPolicy()
 
 
-@pytest.fixture
-def mock_llm_client():
-    """Mock LLM 客户端，避免真实 API 调用"""
-    with patch("app.core.llm.llm_client") as mock:
-        mock.chat = AsyncMock(return_value="这是一个模拟回答，基于提供的上下文。")
-        mock.chat_json = AsyncMock(return_value={
-            "relevance": 4, "faithfulness": 5, "completeness": 3, "overall": 4, "reason": "测试"
-        })
-        mock.stream = AsyncMock(return_value=iter(["这是", "流式", "回答"]))
-        yield mock
-
+# ---------------------------------------------------------------------------
+# Mock infrastructure adapters (inject via DI container)
+# ---------------------------------------------------------------------------
 
 @pytest.fixture
-def mock_embed_client():
-    """Mock Embedding 客户端"""
-    with patch("app.core.llm.embed_client") as mock:
-        mock.embed_one = AsyncMock(return_value=[0.1] * 1024)
-        mock.embed_batch = AsyncMock(return_value=[[0.1] * 1024])
-        yield mock
-
-
-@pytest.fixture
-def mock_redis_cache():
-    """Mock Redis Cache"""
-    with patch("app.db.redis.cache") as mock:
-        mock.get_rag = AsyncMock(return_value=None)
-        mock.set_rag = AsyncMock()
-        mock.get_query = AsyncMock(return_value=None)
-        mock.set_query = AsyncMock()
-        mock.get_embed = AsyncMock(return_value=None)
-        mock.set_embed = AsyncMock()
-        mock.get_global_doc_version = AsyncMock(return_value=0)
-        mock.increment_doc_version = AsyncMock(return_value=1)
-        mock.single_flight = AsyncMock(side_effect=lambda key, coro: coro())
-        mock.client = MagicMock()
-        yield mock
+def mock_llm_service():
+    """Mock LLM service that returns predetermined responses."""
+    svc = AsyncMock()
+    svc.chat.return_value = "This is a mock answer based on the provided context."
+    svc.chat_json.return_value = {
+        "action": "retrieval",
+        "reason": "Knowledge query requiring document retrieval",
+        "tool_name": "",
+        "tool_args": {},
+    }
+    svc.stream.return_value = None  # Set in test if needed
+    svc.close.return_value = None
+    return svc
 
 
 @pytest.fixture
-def mock_milvus():
-    """Mock Milvus"""
-    with patch("app.db.milvus.milvus_db") as mock:
-        mock.search = MagicMock(return_value=[
-            {"id": "chunk-1", "doc_id": "doc-1", "chunk_idx": 0,
-             "text": "这是测试文档内容，用于检索测试", "score": 0.9, "source": "dense"}
-        ])
-        mock.insert = MagicMock()
-        mock.delete_by_doc = MagicMock()
-        mock.get_stats = MagicMock(return_value={"total_entities": 100, "connected": True})
-        mock.is_connected = True
-        yield mock
+def mock_embed_service():
+    """Mock embedding service returning zero vectors."""
+    svc = AsyncMock()
+    svc.embed_one.return_value = [0.1] * 768
+    svc.embed_batch.return_value = [[0.1] * 768]
+    svc.close.return_value = None
+    return svc
+
+
+@pytest.fixture
+def mock_cache_service():
+    """Mock cache that returns None (cache miss) by default."""
+    svc = AsyncMock()
+    svc.connect.return_value = None
+    svc.close.return_value = None
+    svc.get.return_value = None
+    svc.set.return_value = None
+    svc.delete.return_value = None
+    svc.exists.return_value = False
+    svc.get_answer_cache.return_value = None
+    svc.set_answer_cache.return_value = None
+    svc.get_retrieval_cache.return_value = None
+    svc.set_retrieval_cache.return_value = None
+    svc.get_embedding_cache.return_value = None
+    svc.set_embedding_cache.return_value = None
+    svc.get_session_history.return_value = []
+    svc.append_session_message.return_value = None
+    svc.get_long_term_memory.return_value = ""
+    svc.blacklist_token.return_value = None
+    svc.is_token_blacklisted.return_value = False
+    svc.acquire_upload_lock.return_value = True
+    svc.single_flight.return_value = None
+    svc.get_doc_version.return_value = 0
+    return svc
+
+
+@pytest.fixture
+def mock_vector_repo():
+    """Mock vector repository returning fake search results."""
+    repo = AsyncMock()
+    repo.connect.return_value = None
+    repo.close.return_value = None
+    repo.search.return_value = [
+        {
+            "id": "chunk-001",
+            "doc_id": "doc-001",
+            "text": "RAG stands for Retrieval-Augmented Generation.",
+            "score": 0.95,
+            "chunk_idx": 0,
+            "heading": "Introduction",
+            "chunk_type": "text",
+        },
+        {
+            "id": "chunk-002",
+            "doc_id": "doc-001",
+            "text": "It combines retrieval from a knowledge base with LLM generation.",
+            "score": 0.88,
+            "chunk_idx": 1,
+            "heading": "Introduction",
+            "chunk_type": "text",
+        },
+    ]
+    repo.insert.return_value = None
+    repo.delete_by_doc_id.return_value = None
+    repo.get_collection_stats.return_value = {"entity_count": 100}
+    return repo
+
+
+@pytest.fixture
+def mock_search_service():
+    """Mock sparse search returning empty results."""
+    svc = AsyncMock()
+    svc.search.return_value = []
+    svc.add_texts.return_value = None
+    svc.remove_texts.return_value = None
+    svc.clear.return_value = None
+    svc.rebuild.return_value = None
+    return svc
+
+
+@pytest.fixture
+def mock_graph_store():
+    """Mock knowledge graph store."""
+    from app.infrastructure.graph.graph_store import KnowledgeGraph
+    return KnowledgeGraph()
+
+
+@pytest.fixture
+def mock_document_repo():
+    """Mock document repository."""
+    repo = AsyncMock()
+    repo.find_by_id.return_value = None
+    repo.find_by_ids.return_value = []
+    repo.save.return_value = None
+    repo.update_status.return_value = None
+    repo.delete.return_value = None
+    repo.list_all.return_value = []
+    return repo
+
+
+@pytest.fixture
+def test_settings():
+    """Settings instance configured for testing."""
+    from app.config.settings import Settings
+    return Settings(
+        APP_ENV="testing",
+        DATABASE_URL="sqlite+aiosqlite:///test.db",
+        JWT_SECRET="test-secret",
+        SILICONFLOW_API_KEY="sk-test",
+        AGENTIC_RAG_ENABLED=True,
+        GRAPH_RAG_ENABLED=False,
+        RERANKER_MODE="simple",
+    )

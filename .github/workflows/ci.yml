@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  PYTHON_VERSION: "3.11"
+  NODE_VERSION: "20"
+
+jobs:
+  # ── Backend Tests ──────────────────────────
+  backend-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: [6379:6379]
+        options: --health-cmd "redis-cli ping" --health-interval 10s --health-timeout 5s --health-retries 5
+
+    env:
+      APP_ENV: testing
+      DATABASE_URL: sqlite+aiosqlite:///test.db
+      REDIS_URL: redis://localhost:6379/0
+      MILVUS_HOST: localhost
+      MINIO_ENDPOINT: localhost:9000
+      SILICONFLOW_API_KEY: sk-test-ci
+      JWT_SECRET: ci-test-secret-not-for-production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-mock
+
+      - name: Lint (ruff)
+        run: |
+          pip install ruff
+          ruff check app/ --select E,W,F --ignore E501
+
+      - name: Run tests
+        run: |
+          cd ..
+          python -m pytest tests/ -x -q --tb=short
+
+      - name: Upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-test-results
+          path: test.db
+
+  # ── Frontend Tests ─────────────────────────
+  frontend-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Run tests
+        run: npx vitest run --reporter=verbose
+
+      - name: Build frontend
+        run: npm run build
+
+  # ── Docker Build (验证镜像可构建) ───────────
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [backend-test]
+    if: github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build backend image
+        run: docker build -t rag-backend:ci ./backend
+
+      - name: Build frontend image
+        run: docker build -t rag-frontend:ci ./frontend

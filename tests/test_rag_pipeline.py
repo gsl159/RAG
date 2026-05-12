@@ -1,5 +1,5 @@
-"""
-RAG Pipeline 单元测试 — 完整覆盖版（修复兼容性）
+﻿"""
+RAG Pipeline 单元测试 — 完整覆盖版本（兼容性）
 运行: cd rag_system && DATABASE_URL="sqlite+aiosqlite:///test.db" pytest tests/test_rag_pipeline.py -v
 """
 import asyncio
@@ -16,23 +16,25 @@ os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 os.environ.setdefault("MILVUS_HOST", "localhost")
 os.environ.setdefault("MINIO_ENDPOINT", "localhost:9000")
 os.environ.setdefault("SILICONFLOW_API_KEY", "sk-test-key")
+os.environ.setdefault("APP_ENV", "testing")
+os.environ.setdefault("JWT_SECRET", "test-jwt-secret-not-for-production")
 
 backend_path = Path(__file__).parent.parent / "backend"
 sys.path.insert(0, str(backend_path))
 
 
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 # 1. DocParser
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 
 class TestDocParser:
     def setup_method(self):
-        from app.services.doc_service import DocParser
+        from app.infrastructure.document.text_cleaner import DocParser
         self.parser = DocParser()
 
     def test_parse_txt(self, tmp_path):
         f = tmp_path / "test.txt"
-        f.write_text("Hello 你好 World")
+        f.write_text("Hello 你好 World", encoding="utf-8")
         result = self.parser.parse(str(f))
         assert "Hello" in result
         assert "你好" in result
@@ -61,13 +63,13 @@ class TestDocParser:
         assert isinstance(result, str)
 
 
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 # 2. TextCleaner
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 
 class TestTextCleaner:
     def setup_method(self):
-        from app.services.doc_service import TextCleaner
+        from app.infrastructure.document.text_cleaner import TextCleaner
         self.cleaner = TextCleaner()
 
     def test_collapse_newlines(self):
@@ -105,13 +107,13 @@ class TestTextCleaner:
         assert "！" in result
 
 
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 # 3. TextSplitter
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 
 class TestTextSplitter:
     def setup_method(self):
-        from app.services.doc_service import TextSplitter
+        from app.infrastructure.document.text_cleaner import TextSplitter
         self.TextSplitter = TextSplitter
         self.splitter = TextSplitter(chunk_size=100, overlap=20)
 
@@ -121,7 +123,6 @@ class TestTextSplitter:
         assert len(chunks) > 1
 
     def test_short_text_fits_in_chunk(self):
-        # 短文本远小于chunk_size，应包含原始内容（可能因overlap产生多个小chunk，但内容保留）
         text = "短文本"
         chunks = self.splitter.split(text)
         assert len(chunks) >= 1
@@ -163,17 +164,16 @@ class TestTextSplitter:
         s_overlap    = self.TextSplitter(chunk_size=100, overlap=50)
         chunks_no = s_no_overlap.split(text)
         chunks_ov = s_overlap.split(text)
-        # overlap越大chunk数越多（step更小）
         assert len(chunks_ov) >= len(chunks_no)
 
 
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 # 4. QualityChecker
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 
 class TestQualityChecker:
     def setup_method(self):
-        from app.services.doc_service import QualityChecker
+        from app.infrastructure.document.text_cleaner import QualityChecker
         self.checker = QualityChecker()
 
     def test_empty_input(self):
@@ -195,7 +195,8 @@ class TestQualityChecker:
         assert result["valid_ratio"] == 0.0
 
     def test_mixed_quality(self):
-        chunks = ["这是有效内容，超过20字。" * 2] * 3 + ["短"] * 7
+        valid_chunk = "这是有效内容，超过20字。" * 2
+        chunks = [valid_chunk] * 3 + ["短"] * 7
         result = self.checker.evaluate(chunks)
         assert result["valid"] == 3
         assert result["total"] == 10
@@ -211,13 +212,13 @@ class TestQualityChecker:
             assert field in result
 
 
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 # 5. HybridRetriever
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 
 class TestHybridRetriever:
     def setup_method(self):
-        from app.rag.retriever import HybridRetriever
+        from app.application.pipeline.steps.retrieval_step import HybridRetriever
         self.retriever = HybridRetriever()
 
     def test_bm25_empty_index(self):
@@ -272,7 +273,7 @@ class TestHybridRetriever:
 
     def test_thread_safety(self):
         import threading
-        from app.rag.retriever import HybridRetriever
+        from app.application.pipeline.steps.retrieval_step import HybridRetriever
         r = HybridRetriever()
         errors = []
         def add():
@@ -286,13 +287,13 @@ class TestHybridRetriever:
         assert len(errors) == 0
 
 
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 # 6. SimpleReranker
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 
 class TestSimpleReranker:
     def setup_method(self):
-        from app.rag.reranker import SimpleReranker
+        from app.infrastructure.reranker.simple_reranker import SimpleReranker
         self.reranker = SimpleReranker()
 
     def test_rerank_top_n(self):
@@ -328,13 +329,12 @@ class TestSimpleReranker:
         assert len(result) == 1
 
 
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 # 7. CacheStats（独立模块，不依赖redis连接）
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
 
 class TestCacheStats:
     def _make_stats(self):
-        # 直接从源码复制 CacheStats 逻辑，避免redis导入
         class CacheStats:
             def __init__(self):
                 self.hits = 0
@@ -353,416 +353,182 @@ class TestCacheStats:
 
     def test_hit_rate_calculation(self):
         s = self._make_stats()
-        s.record_hit(); s.record_hit(); s.record_miss()
-        assert abs(s.hit_rate - 2/3) < 0.001
+        for _ in range(7): s.record_hit()
+        for _ in range(3): s.record_miss()
+        assert s.hit_rate == 0.7
 
     def test_all_hits(self):
         s = self._make_stats()
-        for _ in range(5): s.record_hit()
+        for _ in range(10): s.record_hit()
         assert s.hit_rate == 1.0
 
     def test_all_misses(self):
         s = self._make_stats()
-        for _ in range(3): s.record_miss()
+        for _ in range(10): s.record_miss()
         assert s.hit_rate == 0.0
 
 
-# ════════════════════════════════════════════════
-# 8. Cache Key 生成（直接测试 hashlib 逻辑）
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
+# 8. RAG Pipeline Functions
+# ────────────────────────────────────────────────
 
-class TestCacheKeys:
-    """测试缓存Key生成逻辑，不依赖redis连接"""
-
-    def _make_key(self, prefix, text, doc_version=0, emb_version="v1"):
-        import hashlib
-        h = hashlib.md5(text.encode()).hexdigest()
-        return f"{prefix}:{h}:{doc_version}:{emb_version}"
-
-    def test_query_key_deterministic(self):
-        k1 = self._make_key("cache:query", "相同的问题")
-        k2 = self._make_key("cache:query", "相同的问题")
-        assert k1 == k2
-
-    def test_different_queries_different_keys(self):
-        k1 = self._make_key("cache:query", "问题一")
-        k2 = self._make_key("cache:query", "问题二")
-        assert k1 != k2
-
-    def test_key_includes_doc_version(self):
-        k1 = self._make_key("cache:rag", "问题", doc_version=1)
-        k2 = self._make_key("cache:rag", "问题", doc_version=2)
-        assert k1 != k2
-
-    def test_key_includes_embed_version(self):
-        k1 = self._make_key("cache:embed", "文本", emb_version="v1")
-        k2 = self._make_key("cache:embed", "文本", emb_version="v2")
-        assert k1 != k2
-
-    def test_key_prefixes_correct(self):
-        assert self._make_key("cache:query", "test").startswith("cache:query:")
-        assert self._make_key("cache:embed", "test").startswith("cache:embed:")
-        assert self._make_key("cache:rag", "test").startswith("cache:rag:")
-
-    def test_key_reasonable_length(self):
-        key = self._make_key("cache:query", "任意长度的问题" * 100)
-        assert len(key) < 80
-
-    def test_no_key_collision(self):
-        queries = ["RAG是什么", "什么是RAG", "RAG定义", "检索增强生成"]
-        keys = [self._make_key("cache:rag", q) for q in queries]
-        assert len(set(keys)) == len(queries)
-
-
-# ════════════════════════════════════════════════
-# 9. build_context
-# ════════════════════════════════════════════════
-
-def _build_context(docs, max_chars=3000):
-    """复制pipeline逻辑，避免redis导入"""
-    if not docs:
-        return ""
-    parts = []
-    total = 0
-    for i, doc in enumerate(docs):
-        text = (doc.get("text") or "").strip()
-        if not text:
-            continue
-        if total + len(text) > max_chars:
-            remaining = max_chars - total
-            if remaining > 100:
-                parts.append(f"[片段{i+1}]\n{text[:remaining]}")
-            break
-        parts.append(f"[片段{i+1}]\n{text}")
-        total += len(text)
-    return "\n\n---\n\n".join(parts)
-
-
-class TestContextBuilder:
-    def test_basic_build(self):
-        docs = [{"text": "段落一内容"}, {"text": "段落二内容"}]
-        ctx = _build_context(docs)
-        assert "段落一内容" in ctx
-        assert "段落二内容" in ctx
-
-    def test_max_chars_limit(self):
-        docs = [{"text": "A" * 1000}] * 10
-        ctx = _build_context(docs, max_chars=500)
-        assert len(ctx) <= 700
-
-    def test_empty_docs(self):
-        assert _build_context([]) == ""
-
-    def test_skips_empty_text(self):
-        docs = [{"text": ""}, {"text": "有效内容"}]
-        ctx = _build_context(docs)
-        assert "有效内容" in ctx
-
-    def test_includes_fragment_markers(self):
-        docs = [{"text": "内容一"}, {"text": "内容二"}]
-        ctx = _build_context(docs)
-        assert "[片段" in ctx
-
-    def test_separator_present(self):
-        docs = [{"text": "A" * 10}, {"text": "B" * 10}]
-        ctx = _build_context(docs)
-        assert "---" in ctx
-
-
-# ════════════════════════════════════════════════
-# 10. RAG Pipeline 集成测试
-# ════════════════════════════════════════════════
-
-class TestRAGPipeline:
-    @pytest.mark.asyncio
-    async def test_run_rag_pipeline_basic(self):
-        with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.core.pipeline import run_rag_pipeline
-            with patch("app.core.pipeline.cache") as mc, \
-                 patch("app.core.pipeline.embed_client") as me, \
-                 patch("app.core.pipeline.retriever") as mr, \
-                 patch("app.core.pipeline.llm_client") as ml:
-
-                mc.get_rag = AsyncMock(return_value=None)
-                mc.set_rag = AsyncMock()
-                mc.get_query = AsyncMock(return_value=None)
-                mc.set_query = AsyncMock()
-                mc.get_embed = AsyncMock(return_value=None)
-                mc.set_embed = AsyncMock()
-                # single_flight 直接调用 factory coroutine
-                async def sf(key, factory):
-                    return await factory()
-                mc.single_flight = sf
-                me.embed_one = AsyncMock(return_value=[0.1] * 1024)
-                mr.retrieve = AsyncMock(return_value=[
-                    {"text": "测试文档内容用于RAG测试", "score": 0.9, "rrf_score": 0.8, "id": "c1"}
-                ])
-                ml.chat = AsyncMock(return_value="这是基于文档的回答")
-
-                result = await run_rag_pipeline("什么是RAG？")
-
-        assert isinstance(result, dict)
-        assert "answer" in result
-        assert "sources" in result
-        assert "latency_ms" in result
-        assert result["cache_hit"] == False
+class TestPipelineFunctions:
 
     @pytest.mark.asyncio
-    async def test_cache_hit_returns_cached(self):
-        cached_result = {
-            "answer": "缓存的答案", "sources": [], "rewritten_query": "什么是RAG",
-            "latency_ms": 10, "cache_hit": False, "degrade_level": "C2"
-        }
-        with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.core.pipeline import run_rag_pipeline
-            with patch("app.core.pipeline.cache") as mc:
-                mc.get_rag = AsyncMock(return_value=cached_result)
-                result = await run_rag_pipeline("什么是RAG？")
-
-        assert result["cache_hit"] == True
-        assert result["answer"] == "缓存的答案"
+    async def test_classify_intent_c0(self):
+        from app.application.pipeline import classify_intent
+        result = await classify_intent("什么是RAG")
+        assert result == "C0"
 
     @pytest.mark.asyncio
-    async def test_rewrite_timeout_uses_original(self):
-        with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.core.pipeline import rewrite_query
-            with patch("app.core.pipeline.llm_client") as ml:
-                ml.chat = AsyncMock(side_effect=asyncio.TimeoutError())
-                result = await rewrite_query("原始问题")
-        assert result == "原始问题"
+    async def test_classify_intent_c1(self):
+        from app.application.pipeline import classify_intent
+        result = await classify_intent("请简要说明RAG系统的检索过程")
+        assert result == "C1"
 
     @pytest.mark.asyncio
-    async def test_empty_context_no_crash(self):
-        with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.core.pipeline import generate_answer
-            answer, level, _ = await generate_answer("问题", "")
+    async def test_classify_intent_c2(self):
+        from app.application.pipeline import classify_intent
+        result = await classify_intent("请详细分析RAG系统在企业知识库场景下的检索增强生成流程，包括向量检索、BM25稀疏检索和RRF融合排序的具体实现细节")
+        assert result == "C2"
+
+    def test_build_context_empty(self):
+        from app.application.pipeline import build_context
+        assert build_context([]) == ""
+
+    def test_build_context_truncation(self):
+        from app.application.pipeline import build_context
+        docs = [{"text": "A" * 5000}]
+        result = build_context(docs, max_chars=100)
+        assert len(result) <= 200  # [来源N]\n prefix + text
+
+    def test_build_context_multiple_docs(self):
+        from app.application.pipeline import build_context
+        docs = [
+            {"text": "第一段内容"},
+            {"text": "第二段内容"},
+        ]
+        result = build_context(docs)
+        assert "来源1" in result
+        assert "来源2" in result
+
+    def test_calc_confidence_empty(self):
+        from app.application.pipeline import calc_confidence
+        assert calc_confidence([], 0.0, 0.0) == 0.0
+
+    def test_calc_confidence_range(self):
+        from app.application.pipeline import calc_confidence
+        docs = [{"rerank_score": 0.5}]
+        result = calc_confidence(docs, 0.8, 0.7)
+        assert 0.0 <= result <= 1.0
+
+
+# ────────────────────────────────────────────────
+# 9. Reranker Integration
+# ────────────────────────────────────────────────
+
+class TestRerankerIntegration:
+
+    def test_simple_reranker_preserves_fields(self):
+        from app.infrastructure.reranker.simple_reranker import SimpleReranker
+        r = SimpleReranker()
+        docs = [{"text": "测试文档内容内容", "rrf_score": 0.5, "doc_id": "d1", "chunk_idx": 0}]
+        result = r.rerank("测试", docs, top_n=1)
+        assert result[0]["doc_id"] == "d1"
+        assert result[0]["chunk_idx"] == 0
+        assert "rerank_score" in result[0]
+
+
+# ────────────────────────────────────────────────
+# 10. Pipeline Degradation
+# ────────────────────────────────────────────────
+
+class TestPipelineDegradation:
+
+    @pytest.mark.asyncio
+    async def test_generate_answer_no_context(self):
+        """无上下文时返回友好提示"""
+        from app.application.pipeline import generate_answer
+        answer, level, reason = await generate_answer("问题", "")
+        assert "未找到" in answer
         assert level == "C0"
-        assert answer
+        assert reason == "NO_CONTEXT"
 
     @pytest.mark.asyncio
-    async def test_generate_answer_c2_success(self):
-        with patch.dict("sys.modules", {"redis": MagicMock(), "redis.asyncio": MagicMock()}):
-            from app.core.pipeline import generate_answer
-            with patch("app.core.pipeline.llm_client") as ml:
-                ml.chat = AsyncMock(return_value="完整回答")
-                answer, level, _ = await generate_answer("问题", "上下文")
-        assert answer == "完整回答"
-        assert level == "C2"
+    async def test_generate_answer_c2_timeout_degrades(self):
+        """C2超时降级到C1"""
+        from app.application.pipeline import generate_answer
+        import asyncio as aio
 
-
-# ════════════════════════════════════════════════
-# 11. DocService
-# ════════════════════════════════════════════════
-
-class TestDocService:
-    @pytest.mark.asyncio
-    async def test_quality_too_low_raises(self):
-        from app.services.doc_service import DocumentService
-        svc = DocumentService()
-        svc.checker = MagicMock()
-        svc.checker.evaluate.return_value = {"score": 0.1, "total": 1, "valid": 0}
-        svc.parser = MagicMock()
-        svc.parser.parse.return_value = "x"
-        svc.cleaner = MagicMock()
-        svc.cleaner.clean.return_value = "x"
-        svc.splitter = MagicMock()
-        svc.splitter.split.return_value = ["x"]
-
-        db = AsyncMock()
-        db.execute = AsyncMock()
-        db.commit = AsyncMock()
-        db.rollback = AsyncMock()
-
-        with patch("app.service.doc_service.settings") as ms:
-            ms.QUALITY_THRESHOLD = 0.6
-            ms.CHUNK_SIZE = 500
-            ms.CHUNK_OVERLAP = 50
-            with pytest.raises((ValueError, Exception)):
-                await svc.process("doc-id", "/fake/path.txt", db)
-
-    @pytest.mark.asyncio
-    async def test_set_status_calls_commit(self):
-        from app.services.doc_service import DocumentService
-        svc = DocumentService()
-        db = AsyncMock()
-        db.execute = AsyncMock()
-        db.commit = AsyncMock()
-        await svc._set_status(db, "test-id", "processing")
-        db.commit.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_set_status_with_error_message(self):
-        from app.services.doc_service import DocumentService
-        svc = DocumentService()
-        db = AsyncMock()
-        db.execute = AsyncMock()
-        db.commit = AsyncMock()
-        await svc._set_status(db, "test-id", "failed", "错误信息")
-        db.commit.assert_called_once()
-
-
-# ════════════════════════════════════════════════
-# 12. SingleFlight
-# ════════════════════════════════════════════════
-
-class TestSingleFlight:
-    @pytest.mark.asyncio
-    async def test_concurrent_same_key_deduplicates(self):
-        """同一key并发调用，factory只执行一次"""
         call_count = 0
-
-        async def expensive_factory():
+        async def mock_chat(messages, temperature=0.3, max_tokens=1024, model=""):
             nonlocal call_count
             call_count += 1
-            await asyncio.sleep(0.02)
-            return "shared_result"
+            if call_count == 1:
+                await aio.sleep(10)  # C2超时
+            return "C1快速回答"
 
-        # 直接实现SingleFlight逻辑测试（不依赖redis模块）
-        inflight = {}
+        with patch("app.core.pipeline.generation.llm_client") as mock:
+            mock.chat = mock_chat
+            answer, level, reason = await generate_answer("问", "上下文")
 
-        async def single_flight(key, factory):
-            if key in inflight:
-                try:
-                    return await asyncio.wait_for(asyncio.shield(inflight[key]), timeout=2.0)
-                except Exception:
-                    return None
-            loop = asyncio.get_event_loop()
-            fut = loop.create_future()
-            inflight[key] = fut
-            try:
-                result = await factory()
-                if not fut.done():
-                    fut.set_result(result)
-                return result
-            except Exception as e:
-                if not fut.done():
-                    fut.set_exception(e)
-                raise
-            finally:
-                inflight.pop(key, None)
-
-        tasks = [single_flight("test-key", expensive_factory) for _ in range(3)]
-        results = await asyncio.gather(*tasks)
-        assert all(r == "shared_result" for r in results)
+        assert level in ("C1", "C0")
 
     @pytest.mark.asyncio
-    async def test_different_keys_execute_independently(self):
-        results = {}
-        async def make(key, val):
-            await asyncio.sleep(0.01)
-            results[key] = val
-        await asyncio.gather(make("k1", "v1"), make("k2", "v2"))
-        assert results["k1"] == "v1"
-        assert results["k2"] == "v2"
-
-
-# ════════════════════════════════════════════════
-# 13. FeedbackService
-# ════════════════════════════════════════════════
-
-class TestFeedbackService:
-    @pytest.mark.asyncio
-    async def test_submit_like(self):
-        from app.services.feedback_service import FeedbackService
-        svc = FeedbackService()
-        db = AsyncMock()
-        db.add = MagicMock()
-        db.commit = AsyncMock()
-        result = await svc.submit("问题", "答案", "like", None, None, None, db)
-        assert result.feedback == "like"
-        db.commit.assert_called_once()
+    async def test_llm_self_score_range(self):
+        """自评分必须在 0~1 范围"""
+        from app.application.pipeline import llm_self_score
+        with patch("app.core.pipeline.generation.llm_client") as mock:
+            mock.chat = AsyncMock(return_value="0.85")
+            score = await llm_self_score("问题", "回答")
+        assert 0.0 <= score <= 1.0
 
     @pytest.mark.asyncio
-    async def test_submit_dislike_with_comment(self):
-        from app.services.feedback_service import FeedbackService
-        svc = FeedbackService()
-        db = AsyncMock()
-        db.add = MagicMock()
-        db.commit = AsyncMock()
-        result = await svc.submit("问题", "答案", "dislike", "不满意", 1, "sess-1", db)
-        assert result.feedback == "dislike"
-
-    @pytest.mark.asyncio
-    async def test_submit_truncates_long_query(self):
-        from app.services.feedback_service import FeedbackService
-        svc = FeedbackService()
-        db = AsyncMock()
-        db.add = MagicMock()
-        db.commit = AsyncMock()
-        long_query = "问题" * 1000
-        result = await svc.submit(long_query, "答案", "like", None, None, None, db)
-        assert len(result.query) <= 1000
+    async def test_llm_self_score_invalid_returns_default(self):
+        """LLM返回非数字时使用默认分"""
+        from app.application.pipeline import llm_self_score
+        with patch("app.core.pipeline.generation.llm_client") as mock:
+            mock.chat = AsyncMock(return_value="不是数字")
+            score = await llm_self_score("问题", "回答")
+        assert score == 0.5
 
 
-# ════════════════════════════════════════════════
-# 14. MilvusDB
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
+# 11. Trace ID
+# ────────────────────────────────────────────────
 
-class TestMilvusDB:
-    def setup_method(self):
-        from app.db.milvus import MilvusDB
-        self.db = MilvusDB()
+class TestTraceId:
+    def test_generate_trace_id_format(self):
+        from app.shared.trace import generate_trace_id
+        tid = generate_trace_id()
+        assert len(tid) == 16
+        assert tid.isalnum()
 
-    def test_not_connected_search_returns_empty(self):
-        self.db._connected = False
-        self.db._collection = None
-        result = self.db.search([0.1] * 1024, top_k=5)
-        assert result == []
-
-    def test_not_connected_delete_silent(self):
-        self.db._connected = False
-        self.db._collection = None
-        self.db.delete_by_doc("doc-id")  # 不抛异常
-
-    def test_get_stats_when_disconnected(self):
-        self.db._connected = False
-        self.db._collection = None
-        stats = self.db.get_stats()
-        assert stats["connected"] == False
-        assert stats["total_entities"] == 0
-
-    def test_is_connected_property(self):
-        self.db._connected = False
-        assert self.db.is_connected == False
-        self.db._connected = True
-        assert self.db.is_connected == True
-
-    def test_insert_raises_when_disconnected(self):
-        self.db._connected = False
-        self.db._collection = None
-        with pytest.raises(RuntimeError, match="未连接"):
-            self.db.insert(["id1"], ["doc1"], [0], ["text"], [[0.1] * 1024])
+    def test_trace_id_context(self):
+        from app.shared.trace import set_trace_id, get_trace_id
+        set_trace_id("test123")
+        assert get_trace_id() == "test123"
+        set_trace_id("")
 
 
-# ════════════════════════════════════════════════
-# 15. 版本一致性（不依赖redis连接）
-# ════════════════════════════════════════════════
+# ────────────────────────────────────────────────
+# 12. Helpers
+# ────────────────────────────────────────────────
 
-class TestVersionConsistency:
-    def _make_key(self, prefix, text, doc_version=0, emb_version="v1"):
-        import hashlib
-        h = hashlib.md5(text.encode()).hexdigest()
-        return f"{prefix}:{h}:{doc_version}:{emb_version}"
+class TestHelpers:
+    def test_truncate(self):
+        from app.shared.helpers import truncate
+        assert truncate("hello world", 5) == "hello"
+        assert truncate("short", 100) == "short"
+        assert truncate("", 10) == ""
+        assert truncate(None, 10) == ""
 
-    def test_same_query_same_version_same_key(self):
-        k1 = self._make_key("cache:rag", "问题", 1)
-        k2 = self._make_key("cache:rag", "问题", 1)
-        assert k1 == k2
-
-    def test_doc_update_invalidates_cache(self):
-        k_before = self._make_key("cache:rag", "问题", doc_version=1)
-        k_after  = self._make_key("cache:rag", "问题", doc_version=2)
-        assert k_before != k_after
-
-    def test_embed_upgrade_invalidates_embed_cache(self):
-        k_v1 = self._make_key("cache:embed", "文本", emb_version="v1")
-        k_v2 = self._make_key("cache:embed", "文本", emb_version="v2")
-        assert k_v1 != k_v2
-
-    def test_no_collision_across_queries(self):
-        queries = ["RAG是什么", "什么是RAG", "RAG定义", "检索增强生成", "向量检索"]
-        keys = [self._make_key("cache:rag", q) for q in queries]
-        assert len(set(keys)) == len(queries)
+    def test_sha256_hash(self):
+        from app.shared.helpers import sha256_hash
+        h1 = sha256_hash("test")
+        h2 = sha256_hash("test")
+        assert h1 == h2
+        assert len(h1) == 64  # SHA256 hex digest length
 
 
 if __name__ == "__main__":

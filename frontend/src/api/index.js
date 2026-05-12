@@ -2,10 +2,24 @@ import axios from 'axios'
 
 const http = axios.create({ baseURL: '/api', timeout: 120_000 })
 
-// 请求拦截：自动带 token
+// 请求拦截：自动带 token，过期时主动跳登录
 http.interceptors.request.use(cfg => {
-  const token = localStorage.getItem('rag_token')
-  if (token) cfg.headers.Authorization = `Bearer ${token}`
+  const token = sessionStorage.getItem('rag_token')
+  if (token) {
+    // 检查 JWT 是否已过期（解析 payload.exp）
+    try {
+      const payload = JSON.parse(atob(token.split('.')[1]))
+      if (payload.exp && payload.exp * 1000 < Date.now()) {
+        sessionStorage.removeItem('rag_token')
+        sessionStorage.removeItem('rag_user')
+        if (window.location.pathname !== '/login') {
+          window.location.href = '/login'
+        }
+        return Promise.reject('Token expired')
+      }
+    } catch { /* malformed token, let server reject */ }
+    cfg.headers.Authorization = `Bearer ${token}`
+  }
   return cfg
 })
 
@@ -26,9 +40,16 @@ http.interceptors.response.use(
   },
   e => {
     const detail = e?.response?.data?.message || e?.response?.data?.detail || e.message || '请求失败'
-    if (e?.response?.status === 401) {
-      localStorage.removeItem('rag_token')
-      localStorage.removeItem('rag_user')
+    const status = e?.response?.status
+    // Global toast for non-401 errors
+    if (status !== 401 && window.$toast) {
+      if (status === 409) window.$toast.warning(detail)
+      else if (status >= 500) window.$toast.error('服务器错误: ' + detail)
+      else if (status === 429) window.$toast.warning('请求过于频繁，请稍后')
+    }
+    if (status === 401) {
+      sessionStorage.removeItem('rag_token')
+      sessionStorage.removeItem('rag_user')
       if (window.location.pathname !== '/login') {
         window.location.href = '/login'
       }
@@ -54,26 +75,29 @@ export const apiUpdateUser   = (id, data) => http.put(`/admin/users/${id}`, data
 export const apiChangePassword = (data) => http.post('/admin/change-password', data)
 
 // ── Admin / API Keys ─────────────────────────
-export const apiCreateApiKey = (name) => http.post('/admin/apikeys', { name })
-export const apiListApiKeys  = ()     => http.get('/admin/apikeys')
-export const apiRevokeApiKey = (id)   => http.delete(`/admin/apikeys/${id}`)
+export const apiCreateApiKey = (name) => http.post('/admin/api-keys', { name })
+export const apiListApiKeys  = ()     => http.get('/admin/api-keys')
+export const apiRevokeApiKey = (id)   => http.delete(`/admin/api-keys/${id}`)
 
 // ── Chat ─────────────────────────────────────
-export const apiChat = (question, session_id, tag_ids) => {
+export const apiChat = (question, session_id, tag_ids, mode) => {
   const payload = { question, session_id }
   if (tag_ids && tag_ids.length) payload.tag_ids = tag_ids
+  if (mode) payload.mode = mode
   return http.post('/chat/', payload)
 }
+export const apiConfirmAnswer = (logId) => http.post('/chat/confirm', { log_id: logId })
 export const apiCreateShare  = (logId) => http.post(`/chat/share/${logId}`)
 export const apiShareQA     = (shareToken) => http.get(`/chat/share/${shareToken}`)
 export const apiSuggestions = ()      => http.get('/chat/suggestions')
 export const apiChatHistory = (skip=0, limit=30) => http.get('/chat/history', { params: { skip, limit } })
 // SSE 流式请求：使用 fetch + ReadableStream 以便通过 Header 传 token（避免 URL 泄露）
-export const fetchStream = async (question, session_id, { onMessage, onError, onDone, onSources, tagIds }) => {
-  const token = localStorage.getItem('rag_token') || ''
+export const fetchStream = async (question, session_id, { onMessage, onError, onDone, onSources, tagIds, mode }) => {
+  const token = sessionStorage.getItem('rag_token') || ''
   let url = `/api/chat/stream?question=${encodeURIComponent(question)}`
   if (session_id) url += `&session_id=${encodeURIComponent(session_id)}`
   if (tagIds && tagIds.length) url += `&tag_ids=${encodeURIComponent(tagIds.join(','))}`
+  if (mode) url += `&mode=${encodeURIComponent(mode)}`
   try {
     const resp = await fetch(url, {
       headers: token ? { 'Authorization': `Bearer ${token}` } : {},
@@ -101,7 +125,26 @@ export const fetchStream = async (question, session_id, { onMessage, onError, on
           try { onSources && onSources(JSON.parse(data.slice(9))) } catch {}
           continue
         }
-        onMessage(data)
+        // Parse JSON event format from SSE stream
+        try {
+          const parsed = JSON.parse(data)
+          if (parsed && typeof parsed.token === 'string') {
+            // Token event: {"token": "text"}
+            onMessage(parsed.token)
+          } else if (parsed && parsed.type === 'sources') {
+            // Sources event: {"type": "sources", "data": [...]}
+            onSources && onSources(parsed.data || [])
+          } else if (parsed && parsed.type === 'done') {
+            // Done event: {"type": "done"}
+            onDone()
+            return
+          } else {
+            onMessage(data)
+          }
+        } catch {
+          // Fallback: plain text or legacy format
+          onMessage(data)
+        }
       }
     }
     onDone()
@@ -116,14 +159,17 @@ export const apiUnbindDocTag = (doc_id, tag_id) => http.post('/tags/unbind', { d
 export const apiDocTags     = (doc_id)    => http.get(`/tags/doc/${doc_id}`)
 
 // ── Upload ───────────────────────────────────
-export const apiUpload         = (fd, overwrite=false) => http.post(`/upload/?overwrite=${overwrite}`, fd)
-export const apiBatchUpload    = (fd)     => http.post('/upload/batch', fd, { timeout: 300_000 })
-export const apiUrlImport      = (urls)   => http.post('/upload/from-url', { urls })
-export const apiListDocs       = (skip=0, limit=30, tag='') => http.get('/upload/docs', { params: { skip, limit, tag: tag || undefined } })
-export const apiGetDoc    = (id)              => http.get(`/upload/docs/${id}`)
-export const apiDeleteDoc = (id)              => http.delete(`/upload/docs/${id}`)
-export const apiRetryDoc  = (id)              => http.post(`/upload/docs/${id}/retry`)
-export const apiDocChunks = (id, skip=0, limit=50) => http.get(`/upload/docs/${id}/chunks`, { params: { skip, limit } })
+export const apiUpload         = (fd, overwrite=false) => http.post(`/documents/upload?overwrite=${overwrite}`, fd)
+export const apiBatchUpload    = (fd)     => http.post('/documents/batch', fd, { timeout: 300_000 })
+export const apiUrlImport      = (urls)   => http.post('/documents/import-url', { urls })
+export const apiListDocs       = (skip=0, limit=30, tag='') => http.get('/documents/', { params: { skip, limit, tag: tag || undefined } })
+export const apiGetDoc    = (id)              => http.get(`/documents/${id}`)
+export const apiDeleteDoc = (id)              => http.delete(`/documents/${id}`)
+export const apiRetryDoc  = (id)              => http.post(`/documents/${id}/retry`)
+export const apiDocChunks = (id, skip=0, limit=50) => http.get(`/documents/${id}/chunks`, { params: { skip, limit } })
+export const apiGetDocPermissions    = (id)                       => http.get(`/documents/${id}/permissions`)
+export const apiAddDocPermission     = (id, scope_type, scope_value) => http.post(`/documents/${id}/permissions`, { scope_type, scope_value })
+export const apiRemoveDocPermission  = (docId, permId)            => http.delete(`/documents/${docId}/permissions/${permId}`)
 
 // ── Feedback ─────────────────────────────────
 export const apiFeedback      = (data) => http.post('/feedback/', data)
@@ -135,10 +181,27 @@ export const apiRagMetrics   = (days=7) => http.get('/metrics/rag', { params: { 
 export const apiCacheMetrics = ()       => http.get('/metrics/cache')
 export const apiDocMetrics   = ()       => http.get('/metrics/docs')
 export const apiQPS          = ()       => http.get('/metrics/qps')
+export const apiListBenchmarks  = (category='', limit=200)  => {
+  const params = { limit }
+  if (category) params.category = category
+  return http.get('/metrics/benchmark', { params })
+}
+export const apiAddBenchmark    = (data)         => http.post('/metrics/benchmark', data)
+export const apiRunBenchmark    = (category='')  => http.post('/metrics/benchmark/run', null, { params: category ? { category } : {}, timeout: 300_000 })
+export const apiDeleteBenchmark = (id)           => http.delete(`/metrics/benchmark/${id}`)
+export const apiLlmStatus       = ()             => http.get('/metrics/llm-status')
 
 // ── Audit ────────────────────────────────────
 export const apiAuditLogs = (page=1, limit=20, action='') =>
-  http.get('/audit/', { params: { page, limit, action } })
+  http.get('/admin/users', { params: { skip: (page-1)*limit, limit } })
+
+// ── Chunking ──────────────────────────────────
+export const getChunkingProgress = (docId) => http.get(`/documents/${docId}/chunking/progress`)
+export const getChunkingReport   = (docId) => http.get(`/documents/${docId}/chunking/report`)
+export const getChunkDetail      = (docId, chunkId) => http.get(`/documents/${docId}/chunks/${chunkId}`)
+export const triggerIncremental  = (docId) => http.post(`/documents/${docId}/chunking/incremental`)
+export const getChunkingMetrics  = (params = {}) => http.get('/metrics/chunking', { params })
+export const getChunkingEvents   = (params = {}) => http.get('/metrics/chunking/events', { params })
 
 // ── Health（不需要 token，用单独 axios 实例）────
 export const apiHealth = () =>

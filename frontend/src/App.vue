@@ -6,7 +6,13 @@
 
   <!-- 主布局 -->
   <div v-else class="shell">
-    <aside class="sidebar">
+    <!-- Mobile overlay -->
+    <div v-if="sidebarOpen" class="sidebar-overlay" @click="sidebarOpen=false"></div>
+    <!-- Mobile hamburger -->
+    <button class="hamburger" @click="sidebarOpen=!sidebarOpen" v-if="!sidebarOpen">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+    </button>
+    <aside class="sidebar" :class="{ open: sidebarOpen }">
       <!-- Scan animation overlay -->
       <div class="sidebar-scan"></div>
 
@@ -81,21 +87,70 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRouter, useRoute } from 'vue-router'
 import { apiHealth, apiLogout } from '@/api/index.js'
+import Toast from '@/components/Toast.vue'
 import ErrorBoundary from '@/components/ErrorBoundary.vue'
 
 const router  = useRouter()
+const route   = useRoute()
 const healthy = ref(true)
 const isDark  = ref(true)
+const sidebarOpen = ref(false)
 let _healthTimer = null
 
+// 路由切换时关闭移动端侧边栏
+watch(() => route.path, () => { sidebarOpen.value = false })
+
 // 主题初始化
-onMounted(() => {
+onMounted(async () => {
   const saved = localStorage.getItem('rag_theme')
   if (saved === 'light') { isDark.value = false; document.documentElement.setAttribute('data-theme', 'light') }
 })
+
+// ── Global keyboard shortcuts ──
+function handleKeydown(e) {
+  // Ignore when typing in inputs
+  const tag = e.target.tagName
+  const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target.isContentEditable
+  
+  // Alt+1~6: navigate pages
+  if (e.altKey && !e.ctrlKey && !e.metaKey) {
+    const nav = { '1': '/', '2': '/docs', '3': '/metrics', '4': '/feedback', '5': '/audit', '6': '/admin' }
+    if (nav[e.key]) { e.preventDefault(); router.push(nav[e.key]); return }
+  }
+
+  // Ctrl+K or /: focus search/chat input (when not in input)
+  if ((e.ctrlKey && e.key === 'k') || (e.key === '/' && !isInput)) {
+    e.preventDefault()
+    const textarea = document.querySelector('.chat-textarea')
+    if (textarea) textarea.focus()
+    else router.push('/')
+    return
+  }
+
+  // Escape: close modals/sidebar
+  if (e.key === 'Escape') {
+    sidebarOpen.value = false
+  }
+
+  // Alt+T: toggle theme
+  if (e.altKey && e.key === 't') {
+    e.preventDefault()
+    toggleTheme()
+  }
+
+  // Alt+N: new session
+  if (e.altKey && e.key === 'n' && route.path === '/') {
+    e.preventDefault()
+    // Emit event for Chat page — handled via custom event
+    window.dispatchEvent(new CustomEvent('rag:new-session'))
+  }
+}
+
+onMounted(() => { document.addEventListener('keydown', handleKeydown) })
+onUnmounted(() => { document.removeEventListener('keydown', handleKeydown) })
 
 function toggleTheme() {
   isDark.value = !isDark.value
@@ -110,7 +165,7 @@ function toggleTheme() {
 
 // 读取本地存储的用户信息
 const userInfo = computed(() => {
-  try { return JSON.parse(localStorage.getItem('rag_user') || '{}') }
+  try { return JSON.parse(sessionStorage.getItem('rag_user') || '{}') }
   catch { return {} }
 })
 const userName    = computed(() => userInfo.value.username || '用户')
@@ -133,8 +188,8 @@ onUnmounted(() => {
 
 async function logout() {
   try { await apiLogout() } catch {}
-  localStorage.removeItem('rag_token')
-  localStorage.removeItem('rag_user')
+  sessionStorage.removeItem('rag_token')
+  sessionStorage.removeItem('rag_user')
   router.push('/login')
 }
 
@@ -286,4 +341,46 @@ html, body, #app { height: 100%; }
 
 /* ── Main ── */
 .main-content { flex: 1; overflow: hidden; display: flex; flex-direction: column; }
+
+/* ── Mobile hamburger ── */
+.hamburger {
+  display: none; position: fixed; top: 10px; left: 10px; z-index: 1100;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px;
+  color: var(--text-1); padding: 6px 8px; cursor: pointer;
+  box-shadow: var(--glow-cyan);
+}
+.sidebar-overlay {
+  display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5);
+  z-index: 999; backdrop-filter: blur(2px);
+}
+
+/* ── Light theme sidebar overrides ── */
+:root[data-theme="light"] .sidebar {
+  background: rgba(255,255,255,0.97); border-right-color: rgba(0,102,204,0.12);
+}
+:root[data-theme="light"] .brand-icon {
+  background: linear-gradient(135deg, #0066cc, #7c3aed); box-shadow: 0 0 10px rgba(0,102,204,0.2);
+}
+:root[data-theme="light"] .brand-name { color: #0066cc; text-shadow: none; }
+:root[data-theme="light"] .nav-link:hover { background: rgba(0,102,204,0.06); border-left-color: rgba(0,102,204,0.3); }
+:root[data-theme="light"] .nav-link--active { background: rgba(0,102,204,0.08); color: #0066cc; border-left-color: #0066cc; text-shadow: none; }
+:root[data-theme="light"] .nav-link--active .nav-icon { filter: none; }
+:root[data-theme="light"] .user-avatar { background: linear-gradient(135deg, #0066cc, #7c3aed); box-shadow: none; }
+:root[data-theme="light"] .sidebar-footer { border-top-color: rgba(0,102,204,0.1); }
+:root[data-theme="light"] .sidebar-scan { display: none; }
+:root[data-theme="light"] .health-dot.ok { background: #00a86b; box-shadow: none; }
+:root[data-theme="light"] .theme-btn:hover { color: #0066cc; filter: none; }
+
+/* ── Responsive ── */
+@media (max-width: 768px) {
+  .hamburger { display: flex; }
+  .sidebar-overlay { display: block; }
+  .sidebar {
+    position: fixed; left: -260px; top: 0; bottom: 0; z-index: 1000;
+    transition: left .25s ease;
+    box-shadow: none;
+  }
+  .sidebar.open { left: 0; box-shadow: 4px 0 24px rgba(0,0,0,0.3); }
+  .main-content { width: 100vw; }
+}
 </style>

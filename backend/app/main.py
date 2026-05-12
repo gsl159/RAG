@@ -1,101 +1,201 @@
-"""RAG System — FastAPI entry point (enterprise architecture)."""
-import asyncio
+"""
+RAG System v3 -- FastAPI application entry point with Dependency Injection.
+
+Architecture
+------------
+- **DI Container** (``app.di.container.DIContainer``) wires all ports to
+  concrete adapters.  No module-level singletons.
+- **Routes** live under ``app.api.routes.*``.  Each controller is a thin
+  HTTP adapter that delegates to use cases from the container.
+- **Middleware** (trace, CORS) and a global exception handler that maps
+  ``RagError`` subclasses to standardised JSON error responses.
+"""
+
+from __future__ import annotations
+
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
+from app.api.middleware import (
+    RequestSizeLimitMiddleware,
+    SecurityHeadersMiddleware,
+    TraceMiddleware,
+    TracingMiddleware,
+)
+from app.api.responses import ok
+from app.api.routes import (
+    admin_router,
+    auth_router,
+    chat_router,
+    documents_router,
+    feedback_router,
+    metrics_router,
+    tags_router,
+    ws_router,
+)
 from app.config.settings import settings, validate_production_settings
-from app.utils.logger import logger
-from app.utils.trace import generate_trace_id, set_trace_id
-from app.api.deps import ok, ErrorCode
-from app.repository.postgres import init_db, engine
-from app.repository.redis_cache import cache
-from app.repository.vector_store import milvus_db
-from app.api import chat, upload, feedback, metrics, auth, audit
-from app.api.admin import router as admin_router
-from app.api.tags import router as tags_router
-from app.api.ws import router as ws_router
+from app.di.container import DIContainer
+# Import all models so that ``Base.metadata`` discovers every table
+# before ``init_database()`` is called in the lifespan.
+import app.infrastructure.persistence.models  # NOQA: F401
+
+from app.infrastructure.persistence.models.base import init_database
+from app.domain.ports.task_queue_port import TaskItem
+from app.shared.logging import logger, setup_logger
 
 
-async def _bm25_rebuild_task() -> None:
-    """后台分批拉取 Chunk 文本并一次性重建 BM25，避免阻塞进程就绪。"""
-    try:
-        from sqlalchemy import select
-
-        from app.core.retriever import retriever
-        from app.repository.postgres import AsyncSessionLocal, Chunk
-
-        batch = settings.BM25_REBUILD_BATCH_FETCH
-        all_texts: list[str] = []
-        async with AsyncSessionLocal() as db:
-            offset = 0
-            while True:
-                result = await db.execute(select(Chunk.content).limit(batch).offset(offset))
-                rows = result.all()
-                if not rows:
-                    break
-                all_texts.extend(row[0] for row in rows if row[0])
-                offset += batch
-        if all_texts:
-            retriever.replace_corpus(all_texts)
-            logger.info(f"BM25 index rebuilt with {len(all_texts)} chunks (background)")
-        else:
-            logger.info("BM25: no chunks found, skipping")
-    except Exception as e:
-        logger.warning(f"BM25 index rebuild failed (non-fatal): {e}")
+# ---------------------------------------------------------------------------
+# Lifespan -- startup / shutdown
+# ---------------------------------------------------------------------------
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("=" * 60)
-    logger.info(f"RAG System starting... ENV={settings.APP_ENV}")
-    validate_production_settings(settings)
-    try:
-        await init_db()
-        logger.info("PostgreSQL initialized")
-    except Exception as e:
-        logger.error(f"PostgreSQL init failed: {e}")
-    try:
-        await cache.connect()
-        logger.info("Redis connected")
-    except Exception as e:
-        logger.error(f"Redis connection failed: {e}")
-    try:
-        milvus_db.connect()
-        logger.info("Milvus connected")
-    except Exception as e:
-        logger.error(f"Milvus connection failed: {e}")
-    if settings.BM25_REBUILD_ON_STARTUP:
-        if settings.BM25_REBUILD_ASYNC:
-            asyncio.create_task(_bm25_rebuild_task())
-            logger.info("BM25 rebuild scheduled (non-blocking)")
-        else:
-            await _bm25_rebuild_task()
-    else:
-        logger.info("BM25 startup rebuild skipped (BM25_REBUILD_ON_STARTUP=false)")
-    logger.info("System startup complete")
-    yield
-    # 优雅关闭资源
-    from app.core.generator import llm_client, embed_client
-    try:
-        await llm_client.close()
-        await embed_client.close()
-    except Exception as e:
-        logger.warning(f"HTTP client cleanup failed: {e}")
-    await engine.dispose()
-    logger.info("RAG System shut down")
+    """Application lifespan: initialise and tear down the DI container."""
+    # --- Startup ---
+    setup_logger(settings.LOG_LEVEL, settings.APP_ENV)
 
+    # Setup OpenTelemetry tracing (optional, based on OTLP_ENDPOINT env)
+    otlp_endpoint = getattr(settings, "OTLP_ENDPOINT", "") or ""
+    if otlp_endpoint:
+        from app.infrastructure.observability.tracing import (
+            instrument_app,
+            setup_tracing,
+        )
+
+        setup_tracing("rag-system", otlp_endpoint)
+        instrument_app(app)
+
+    logger.info("=" * 60)
+    logger.info("RAG System v3 starting ... ENV={}", settings.APP_ENV)
+
+    validate_production_settings(settings)
+
+    # Auto-create database tables (no-op if already exist)
+    try:
+        await init_database(settings.DATABASE_URL)
+        logger.info("Database tables verified / created")
+    except Exception as e:
+        logger.error("Database initialisation failed: {}", e)
+
+    # Ensure default admin user exists on first startup
+    try:
+        from app.infrastructure.persistence.models.user import User as UserModel
+        from app.api.deps.auth import get_password_hash
+        from app.infrastructure.persistence.models.base import get_session_factory
+        from sqlalchemy import select
+        import uuid
+
+        session_factory = get_session_factory(settings.DATABASE_URL)
+        async with session_factory() as session:
+            result = await session.execute(
+                select(UserModel).where(UserModel.username == "admin")
+            )
+            admin = result.scalar_one_or_none()
+            if admin is None:
+                admin_user = UserModel(
+                    id=str(uuid.uuid4()),
+                    username="admin",
+                    password_hash=get_password_hash(settings.DEFAULT_ADMIN_PASSWORD),
+                    role="super_admin",
+                    tenant_id="default",
+                    is_active=True,
+                )
+                session.add(admin_user)
+                await session.commit()
+                logger.info("Default admin user created (username=admin)")
+            else:
+                logger.info("Admin user already exists, skipping creation")
+    except Exception as e:
+        logger.warning("Failed to ensure default admin user: {}", e)
+
+    container = DIContainer(settings)
+    try:
+        await container.init_async()
+        logger.info("DI container initialised -- all services connected")
+    except Exception as e:
+        logger.error("Container initialisation failed: {}", e)
+
+    app.state.container = container
+
+    # Start background document processing worker
+    import asyncio as _asyncio
+    worker_count = settings.TASK_QUEUE_WORKERS
+    worker_tasks = []
+    worker_stop = _asyncio.Event()
+
+    async def _doc_worker(worker_id: int):
+        logger.info("Document worker {} started", worker_id)
+        while not worker_stop.is_set():
+            try:
+                task = await container.task_queue.dequeue(timeout=5.0)
+                if task is None:
+                    continue
+                logger.info("Worker {} processing doc_id={}", worker_id, task.doc_id)
+                await container.doc_use_case.process_document(task.doc_id)
+            except _asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Worker {} error: {}", worker_id, e)
+                await _asyncio.sleep(1)
+        logger.info("Document worker {} stopped", worker_id)
+
+    for i in range(worker_count):
+        t = _asyncio.create_task(_doc_worker(i))
+        worker_tasks.append(t)
+
+    # Scan for existing pending documents that need processing
+    try:
+        pending_docs = await container.doc_repo.list_all("default", limit=100)
+        for doc in pending_docs:
+            if str(doc.status) == "pending":
+                logger.info("Re-queuing pending document: doc_id={} name={}", doc.id, doc.filename)
+                task_item = TaskItem(doc_id=doc.id, file_ext=doc.file_type, content=b"")
+                await container.task_queue.enqueue(task_item)
+    except Exception as e:
+        logger.warning("Failed to scan pending documents: {}", e)
+
+    logger.info("RAG System v3 started successfully ({} doc workers)", worker_count)
+
+    yield
+
+    # --- Shutdown ---
+    worker_stop.set()
+    for t in worker_tasks:
+        t.cancel()
+    # Wait for workers to finish
+    await _asyncio.gather(*worker_tasks, return_exceptions=True)
+    logger.info("All document workers stopped")
+
+    # --- Shutdown ---
+    try:
+        await container.close_async()
+        logger.info("DI container shut down -- all connections closed")
+    except Exception as e:
+        logger.warning("Container shutdown error: {}", e)
+    logger.info("RAG System v3 shut down")
+
+
+# ---------------------------------------------------------------------------
+# Application factory
+# ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="RAG Knowledge System",
-    version="2.0.0",
+    title="Enterprise RAG System",
+    version="3.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
 
+# -- Middleware stack (outermost first) --
+
+app.add_middleware(SecurityHeadersMiddleware)
+app.add_middleware(TracingMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware)
+app.add_middleware(TraceMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -104,83 +204,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -- Global exception handler --
 
-@app.middleware("http")
-async def trace_middleware(request: Request, call_next):
-    """Inject trace_id into every request and propagate via context."""
-    trace_id = request.headers.get("X-Trace-Id") or generate_trace_id()
-    set_trace_id(trace_id)
-    request.state.trace_id = trace_id
-    response = await call_next(request)
-    response.headers["X-Trace-Id"] = trace_id
-    return response
+from app.api.error_handler import global_error_handler
+
+app.add_exception_handler(Exception, global_error_handler)
+
+# -- Routes -- all under /api/v1 prefix --
+
+API_PREFIX = "/api/v1"
+
+app.include_router(auth_router, prefix=API_PREFIX)
+app.include_router(chat_router, prefix=API_PREFIX)
+app.include_router(documents_router, prefix=API_PREFIX)
+app.include_router(admin_router, prefix=API_PREFIX)
+app.include_router(feedback_router, prefix=API_PREFIX)
+app.include_router(metrics_router, prefix=API_PREFIX)
+app.include_router(tags_router, prefix=API_PREFIX)
+app.include_router(ws_router, prefix=API_PREFIX)
 
 
-@app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception):
-    import traceback as _tb
-    trace_id = getattr(request.state, "trace_id", "")
-    logger.error(f"[{trace_id}] Unhandled exception [{request.method} {request.url}]: {exc}")
-    logger.error(_tb.format_exc())
-    return JSONResponse(
-        status_code=500,
-        content={
-            "code": ErrorCode.SYSTEM_ERROR,
-            "message": "Internal server error, please try again later",
-            "data": None,
-            "trace_id": trace_id,
-        },
+# ---------------------------------------------------------------------------
+# System endpoints (no prefix)
+# ---------------------------------------------------------------------------
+
+
+
+
+@app.get("/api/v1/health")
+async def api_health():
+    """Health check under the API prefix for nginx proxy compatibility."""
+    return await health()
+
+
+@app.get("/health")
+async def health():
+    """Combined health check -- verifies connectivity to all backends."""
+    container: DIContainer | None = getattr(app.state, "container", None)
+
+    checks = {
+        "postgres": False,
+        "redis": False,
+        "milvus": False,
+        "minio": False,
+    }
+
+    if container:
+        try:
+            _ = await container.doc_repo.count_by_tenant("default")
+            checks["postgres"] = True
+        except Exception:
+            pass
+
+        try:
+            _ = await container.cache_service.get("health_check")
+            checks["redis"] = True
+        except Exception:
+            pass
+
+        try:
+            _ = await container.vector_repo.get_collection_stats()
+            checks["milvus"] = True
+        except Exception:
+            pass
+
+        try:
+            checks["minio"] = await container.storage_service.is_connected()
+        except Exception:
+            pass
+
+    all_ok = all(checks.values())
+
+    return ok(
+        {
+            "status": "ok" if all_ok else "degraded",
+            "version": "3.0.0",
+            "env": settings.APP_ENV,
+            "checks": checks,
+        }
     )
 
 
-app.include_router(auth.router)
-app.include_router(chat.router)
-app.include_router(upload.router)
-app.include_router(feedback.router)
-app.include_router(metrics.router)
-app.include_router(audit.router)
-app.include_router(admin_router)
-app.include_router(tags_router)
-app.include_router(ws_router)
-
-
-@app.get("/health", tags=["System"])
-async def health():
-    # PostgreSQL 连通性检查
-    pg_ok = False
-    try:
-        from app.repository.postgres import AsyncSessionLocal
-        from sqlalchemy import text
-        async with AsyncSessionLocal() as db:
-            await db.execute(text("SELECT 1"))
-            pg_ok = True
-    except Exception:
-        pass
-
-    # Redis 连通性检查
-    redis_ok = False
-    try:
-        if cache.client:
-            await cache.client.ping()
-            redis_ok = True
-    except Exception:
-        pass
-
-    milvus_ok = milvus_db.is_connected
-    all_ok = pg_ok and redis_ok and milvus_ok
-
-    return ok({
-        "status": "ok" if all_ok else "degraded",
-        "version": "2.0.0",
-        "env": settings.APP_ENV,
-        "checks": {
-            "postgres": pg_ok,
-            "milvus": milvus_ok,
-            "redis": redis_ok,
-        },
-    })
-
-
-@app.get("/", tags=["System"])
+@app.get("/")
 async def root():
-    return ok({"message": "RAG Knowledge System is running", "docs": "/docs"})
+    """Root endpoint -- API information."""
+    return ok(
+        {
+            "message": "Enterprise RAG System is running",
+            "version": "3.0.0",
+            "docs": "/docs",
+        }
+    )

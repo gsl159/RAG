@@ -21,8 +21,23 @@ const routes = [
 const router = createRouter({ history: createWebHistory(), routes })
 
 router.beforeEach((to) => {
-  const token = localStorage.getItem('rag_token')
+  const token = sessionStorage.getItem('rag_token')
   if (!to.meta.public && !token) return { path: '/login' }
+  // 基本 JWT 过期检查（客户端预检，服务端仍做权威验证）
+  if (token && !to.meta.public) {
+    try {
+      const payload = JSON.parse(atob(token.split('.')[1]))
+      if (payload.exp && payload.exp * 1000 < Date.now()) {
+        sessionStorage.removeItem('rag_token')
+        sessionStorage.removeItem('rag_user')
+        return { path: '/login' }
+      }
+    } catch {
+      sessionStorage.removeItem('rag_token')
+      sessionStorage.removeItem('rag_user')
+      return { path: '/login' }
+    }
+  }
 })
 
 export default router

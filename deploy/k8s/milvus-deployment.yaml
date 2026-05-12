@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: milvus
+  namespace: rag-system
+  labels:
+    app.kubernetes.io/name: milvus
+    app.kubernetes.io/part-of: rag-system
+    app.kubernetes.io/component: vector-db
+spec:
+  ports:
+    - port: 19530
+      targetPort: 19530
+      name: milvus
+  selector:
+    app.kubernetes.io/name: milvus
+    app.kubernetes.io/part-of: rag-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: milvus
+  namespace: rag-system
+  labels:
+    app.kubernetes.io/name: milvus
+    app.kubernetes.io/part-of: rag-system
+    app.kubernetes.io/component: vector-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: milvus
+      app.kubernetes.io/part-of: rag-system
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: milvus
+        app.kubernetes.io/part-of: rag-system
+        app.kubernetes.io/component: vector-db
+    spec:
+      containers:
+        - name: milvus
+          image: milvusdb/milvus:v2.4.5
+          command:
+            - milvus
+            - run
+            - standalone
+          ports:
+            - containerPort: 19530
+              name: milvus
+          env:
+            - name: ETCD_ENDPOINTS
+              value: "localhost:2379"
+            - name: MINIO_ADDRESS
+              value: "localhost:9000"
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-system-secret
+                  key: MINIO_ACCESS_KEY
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rag-system-secret
+                  key: MINIO_SECRET_KEY
+            - name: ETCD_USE_EMBED
+              value: "false"
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "500m"
+            limits:
+              memory: "4Gi"
+              cpu: "2000m"
+          livenessProbe:
+            tcpSocket:
+              port: 19530
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 5
+          readinessProbe:
+            tcpSocket:
+              port: 19530
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          startupProbe:
+            tcpSocket:
+              port: 19530
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+        - name: etcd
+          image: quay.io/coreos/etcd:v3.5.15
+          command:
+            - etcd
+            - --data-dir=/etcd-data
+            - --advertise-client-urls=http://localhost:2379
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-advertise-peer-urls=http://localhost:2380
+            - --initial-cluster=default=http://localhost:2380
+            - --initial-cluster-state=new
+          ports:
+            - containerPort: 2379
+              name: etcd-client
+            - containerPort: 2380
+              name: etcd-peer
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          volumeMounts:
+            - name: etcd-data
+              mountPath: /etcd-data
+      volumes:
+        - name: etcd-data
+          emptyDir: {}
