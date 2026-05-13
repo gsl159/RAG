@@ -1,7 +1,7 @@
 """Domain entities re-exports."""
 
 from .conversation import ConversationSummary, Message, Session
-from .document import Chunk, ChunkType, Document, DocumentStatus
+from .document import Chunk, ChunkRelationType, ChunkType, Document, DocumentStatus, Section
 from .evaluation import Benchmark, Evaluation, Feedback
 from .query import (
     AgentAction,
@@ -20,6 +20,8 @@ __all__ = [
     "DocumentStatus",
     "Chunk",
     "ChunkType",
+    "ChunkRelationType",
+    "Section",
     # query
     "IntentComplexity",
     "IntentSemanticType",

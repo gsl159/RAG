@@ -4,14 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 
 @dataclass
 class LanguageProfile:
-    """Language characteristics of a text segment."""
-
-    primary_language: str  # "zh" | "en" | "mixed"
+    primary_language: str
     zh_ratio: float
     en_ratio: float
     avg_word_length: float = 5.0
@@ -19,61 +17,56 @@ class LanguageProfile:
 
 @dataclass
 class ChunkingParams:
-    """Computed chunking parameters for a document."""
-
     chunk_size: int
     chunk_overlap: int
     min_chunk_size: int
     max_chunk_size: int
     language: str
     enable_semantic_boundary: bool = True
+    doc_type: str = ""
 
 
 @dataclass
 class ChunkMetadata:
-    """Rich metadata for a single chunk."""
-
     doc_id: str
     doc_name: str = ""
     doc_version: str = ""
     source_path: str = ""
     file_format: str = ""
     chunk_index: int = 0
-    page_number: Optional[int] = None
+    page_number: int | None = None
     section_path: list[str] = field(default_factory=list)
     char_start: int = 0
     char_end: int = 0
     chunk_strategy: str = ""
     structure_type: str = ""
     language: str = ""
-    parent_chunk_id: Optional[str] = None
-    prev_chunk_id: Optional[str] = None
-    next_chunk_id: Optional[str] = None
+    parent_chunk_id: str | None = None
+    prev_chunk_id: str | None = None
+    next_chunk_id: str | None = None
     chunk_id: str = ""
-    created_at: Optional[datetime] = None
+    created_at: datetime | None = None
     chunk_hash: str = ""
 
 
 @dataclass
 class PipelineStage:
-    """Tracks execution of a single pipeline stage."""
-
     stage: int
     name: str
-    status: str = "pending"  # pending/processing/completed/failed/skipped
+    status: str = "pending"
     duration_ms: int = 0
-    error: Optional[dict] = None
+    error: dict | None = None
 
 
 @dataclass
 class ChunkingResult:
-    """Aggregate result produced by the chunking pipeline."""
-
-    chunks: list[Any]
+    chunks: list[Any] = field(default_factory=list)
+    sections: list[Any] = field(default_factory=list)
     total_chunks: int = 0
     filtered_chunks: int = 0
     filter_rate: float = 0.0
     strategy_used: str = ""
+    doc_type: str = ""
     processing_time_ms: int = 0
     doc_id: str = ""
     doc_version: str = ""
@@ -84,16 +77,15 @@ class ChunkingResult:
 
 @dataclass
 class ChunkingError:
-    """Structured error for chunking failures."""
-
     error_code: str
     error_message: str
     doc_name: str = ""
     stage: str = ""
     recoverable: bool = False
+
+
 @dataclass
 class FilterResult:
-    """Result of quality filtering."""
     total_chunks: int = 0
     passed_chunks: list = field(default_factory=list)
     rejected_chunks: list = field(default_factory=list)
@@ -102,3 +94,11 @@ class FilterResult:
     dedup_algorithm_used: str = "minhash"
     warning_filter_rate_exceeded: bool = False
 
+
+@dataclass
+class SectionEmbeddingRequest:
+    section_id: str
+    section_title: str
+    section_path: list[str]
+    combined_text: str
+    document_id: str
